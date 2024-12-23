@@ -14,6 +14,8 @@ import seaborn as sns
 from torchsummary import summary
 from io import StringIO
 import sys
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import label_binarize
 
 # Vô hiệu hóa cảnh báo FutureWarning, UserWarning, DeprecationWarning
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -195,7 +197,7 @@ def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad
     best_acc = 0.0
     # Open a file to log the training process
     with open('efficientnet_b4+V3_log.csv', 'w') as log_file:
-        log_file.write('Epoch,Phase,Loss,Accuracy,Precision,Recall,F1-Score\n')
+        log_file.write('Epoch,Phase,Loss,Accuracy,Precision,Recall,F1-Score,AUC\n')
         for epoch in range(num_epochs):
             print(f'Epoch {epoch+1}/{num_epochs}')
             print('-' * 30)
@@ -262,20 +264,24 @@ def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad
                 epoch_loss = running_loss / dataset_sizes[phase]
                 epoch_acc = running_corrects / dataset_sizes[phase]
             
-                # Calculate precision, recall, and F1-score for both phases
+                # Calculate precision, recall, F1-score, and AUC for both phases
                 if len(all_preds) > 0 and len(all_labels) > 0:
                     precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
                     recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
                     f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+                    all_labels_bin = label_binarize(all_labels, classes=range(num_classes))
+                    all_preds_bin = label_binarize(all_preds, classes=range(num_classes))
+                    auc = roc_auc_score(all_labels_bin, all_preds_bin, average='weighted', multi_class='ovr')
                 else:
                     precision = 0.0
                     recall = 0.0
                     f1 = 0.0
+                    auc = 0.0
             
-                log_file.write(f'{epoch+1},{phase},{epoch_loss:.4f},{epoch_acc:.4f},{precision:.4f},{recall:.4f},{f1:.4f}\n')
+                log_file.write(f'{epoch+1},{phase},{epoch_loss:.4f},{epoch_acc:.4f},{precision:.4f},{recall:.4f},{f1:.4f},{auc:.4f}\n')
                 print(f'  {phase.capitalize()} Phase:')
                 # Print the metrics
-                print(f'    Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1:.4f}')
+                print(f'    Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1:.4f} | AUC: {auc:.4f}')
 
                 if phase == 'val':
                     # Early stopping logic
@@ -316,14 +322,22 @@ def evaluate_model(model, dataloader):
             _, preds = torch.max(outputs, 1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+    
     precision = precision_score(all_labels, all_preds, average='weighted')
     recall = recall_score(all_labels, all_preds, average='weighted')
     f1 = f1_score(all_labels, all_preds, average='weighted')
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
+    
+    # Calculate AUC
+    all_labels_bin = label_binarize(all_labels, classes=range(num_classes))
+    all_preds_bin = label_binarize(all_preds, classes=range(num_classes))
+    auc = roc_auc_score(all_labels_bin, all_preds_bin, average='weighted', multi_class='ovr')
+    
     with open('efficientnet_b4+V3_log.csv', 'a') as log_file:
         log_file.write('Evaluation Metrics:\n')
-        log_file.write(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}\n')
-    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}')
+        log_file.write(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}, AUC: {auc:.4f}\n')
+    
+    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}, AUC: {auc:.4f}')
 
 evaluate_model(model, dataloaders['val'])
 

@@ -1,21 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms, models
+from torchvision import models, datasets, transforms
 from torch.utils.data import DataLoader, random_split
-import warnings
-import numpy as np
-import copy
-from sklearn.metrics import precision_score, recall_score, f1_score
 from efficientnet_pytorch import EfficientNet
-from torch.amp import GradScaler, autocast
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-from torchsummary import summary
-from io import StringIO
-import sys
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score
+import warnings
+import copy
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.swa_utils import AveragedModel, SWALR
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import label_binarize
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+import torch.nn.functional as F
+import sys
+from io import StringIO
+from torchsummary import summary
 
 # Vô hiệu hóa cảnh báo FutureWarning, UserWarning, DeprecationWarning
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -61,50 +63,53 @@ val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4
 dataloaders = {'train': train_loader, 'val': val_loader}
 dataset_sizes = {'train': len(train_dataset), 'val': len(val_dataset)}
 
-# Load EfficientNet-B4 và ResNet50
-efficientnet = EfficientNet.from_pretrained('efficientnet-b4')
-resnet = models.resnet50(pretrained=True)
+# Load pre-trained models
+name_log = 'EfficientNet_B5_MobileNetV2_ResNet18'
+efficientnet = EfficientNet.from_pretrained('efficientnet-b5')
+mobilenet = models.mobilenet_v2(pretrained=True)
+resnet50 = models.resnet18(pretrained=True)
 
 # Chỉnh sửa lớp đầu ra cuối cùng
 num_ftrs_efficient = efficientnet._fc.in_features
 efficientnet._fc = nn.Linear(num_ftrs_efficient, 512)
 
-num_ftrs_resnet = resnet.fc.in_features
-resnet.fc = nn.Linear(num_ftrs_resnet, 512)
+num_ftrs_mobilenet = mobilenet.classifier[-1].in_features
+mobilenet.classifier[-1] = nn.Linear(num_ftrs_mobilenet, 512)
+
+num_ftrs_resnet = resnet50.fc.in_features
+resnet50.fc = nn.Linear(num_ftrs_resnet, 512)
 
 # Mô hình kết hợp
 class CombinedModel(nn.Module):
-    def __init__(self, efficientnet, resnet, num_classes):
+    def __init__(self, efficientnet, mobilenet, resnet50, num_classes):
         super(CombinedModel, self).__init__()
         self.efficientnet = efficientnet
-        self.resnet = resnet
-        self.fc1 = nn.Linear(512 * 2, 1024)
+        self.mobilenet = mobilenet
+        self.resnet50 = resnet50
+        self.fc1 = nn.Linear(512 * 3, 1024)
         self.bn1 = nn.BatchNorm1d(1024)
         self.fc2 = nn.Linear(1024, 512)
         self.bn2 = nn.BatchNorm1d(512)
-        self.fc3 = nn.Linear(512, num_classes)
+        self.fc3 = nn.Linear(512, 256)
+        self.bn3 = nn.BatchNorm1d(256)
+        self.fc4 = nn.Linear(256, 128)
+        self.bn4 = nn.BatchNorm1d(128)
+        self.fc5 = nn.Linear(128, num_classes)
+
     
     def forward(self, x):
         out1 = self.efficientnet(x)
-        out2 = self.resnet(x)
-        combined_out = torch.cat((out1, out2), dim=1)
+        out2 = self.mobilenet(x)
+        out3 = self.resnet50(x)
+        combined_out = torch.cat((out1, out2, out3), 1)
         combined_out = torch.relu(self.bn1(self.fc1(combined_out)))
         combined_out = torch.relu(self.bn2(self.fc2(combined_out)))
-        final_out = self.fc3(combined_out)
+        combined_out = torch.relu(self.bn3(self.fc3(combined_out)))
+        combined_out = torch.relu(self.bn4(self.fc4(combined_out)))
+        final_out = self.fc5(combined_out)  
         return final_out
 
-# Khởi tạo mô hình kết hợp
-num_classes = len(dataset.classes)
-model = CombinedModel(efficientnet, resnet, num_classes)
-
-# Sử dụng DataParallel để sử dụng nhiều GPU
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs")
-    model = nn.DataParallel(model)
-
-model = model.to(device)
-
-# Early Stopping Class
+# Label Smoothing CrossEntropy
 class LabelSmoothingCrossEntropy(nn.Module):
     def __init__(self, smoothing=0.1):
         super(LabelSmoothingCrossEntropy, self).__init__()
@@ -154,6 +159,11 @@ def mixup_data(x, y, alpha=1.0):
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
+# Gradient Clipping
+def clip_gradient(max_norm=2.0):
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+# Early Stopping Class
 class EarlyStopping:
     def __init__(self, patience=7, verbose=False):
         self.patience = patience
@@ -189,15 +199,19 @@ class EarlyStopping:
         self.val_loss_min = val_loss
 
 # Hàm huấn luyện
-def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad_clip=1.0):
+def train_model(model, criterion, optimizer, scheduler, early_stopping, num_epochs=200, use_cutmix=True, use_mixup=True, gradient_accumulation_steps=4):
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
+
     # Open a file to log the training process
-    with open('efficientnet_b4+Resnet50_log.csv', 'w') as log_file:
-        log_file.write('Epoch,Phase,Loss,Accuracy,Precision,Recall,F1-Score\n')
+    with open(name_log + '.csv', 'w') as log_file:
+        log_file.write('Epoch,Train Loss,Train Acc,Train Precision,Train Recall,Train F1,Val Loss,Val Acc,Val Precision,Val Recall,Val F1\n')
         for epoch in range(num_epochs):
             print(f'Epoch {epoch+1}/{num_epochs}')
             print('-' * 30)
+            
+            epoch_train_loss, epoch_train_acc, epoch_train_precision, epoch_train_recall, epoch_train_f1 = 0, 0, 0, 0, 0
+            epoch_val_loss, epoch_val_acc, epoch_val_precision, epoch_val_recall, epoch_val_f1 = 0, 0, 0, 0, 0
             
             for phase in ['train', 'val']:
                 if phase == 'train':
@@ -210,143 +224,148 @@ def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad
                 all_preds = []
                 all_labels = []
 
-                for inputs, labels in dataloaders[phase]:
+                optimizer.zero_grad()
+
+                for i, (inputs, labels) in enumerate(dataloaders[phase]):
                     inputs = inputs.to(device)
                     labels = labels.to(device)
-                
-                    optimizer.zero_grad()
-                    
+
                     if phase == 'train':
-                        # Randomly decide to apply CutMix or Mixup
-                        rand = np.random.rand()
-                        if rand < 0.5:
-                            # Apply CutMix
+                        if use_cutmix:
                             inputs, targets_a, targets_b, lam = cutmix_data(inputs, labels)
-                            with autocast(device_type=device.type):
-                                outputs = model(inputs)
-                                loss = criterion(outputs, targets_a) * lam + criterion(outputs, targets_b) * (1 - lam)
-                        else:
-                            # Apply Mixup
+                        elif use_mixup:
                             inputs, targets_a, targets_b, lam = mixup_data(inputs, labels)
-                            with torch.amp.autocast(device_type=device.type):
-                                outputs = model(inputs)
-                                loss = criterion(outputs, targets_a) * lam + criterion(outputs, targets_b) * (1 - lam)
-                        _, preds = torch.max(outputs, 1)
-                        # Calculate correct predictions
-                        preds_cpu = preds.cpu()
-                        targets_a_cpu = targets_a.cpu()
-                        targets_b_cpu = targets_b.cpu()
-                        running_corrects += (lam * (preds_cpu == targets_a_cpu).sum().item() + (1 - lam) * (preds_cpu == targets_b_cpu).sum().item())
-                        all_preds.extend(preds.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
-                        running_loss += loss.item() * inputs.size(0)
-                
-                    else:
-                        with torch.no_grad():
+
+                        inputs, targets_a, targets_b = inputs.to(device), targets_a.to(device), targets_b.to(device)
+
+                    with torch.set_grad_enabled(phase == 'train'):
+                        with autocast():
                             outputs = model(inputs)
-                            loss = criterion(outputs, labels)
                             _, preds = torch.max(outputs, 1)
-                            running_corrects += torch.sum(preds == labels.data).item()
-                            all_preds.extend(preds.cpu().numpy())
-                            all_labels.extend(labels.cpu().numpy())
-                            running_loss += loss.item() * inputs.size(0)
-                
-                    if phase == 'train':
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                        scaler.step(optimizer)
-                        scaler.update()
-                
+                            
+                            if phase == 'train' and (use_cutmix or use_mixup):
+                                loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+                            else:
+                                loss = criterion(outputs, labels)
+
+                        if phase == 'train':
+                            loss = loss / gradient_accumulation_steps
+                            scaler.scale(loss).backward()
+
+                            if (i + 1) % gradient_accumulation_steps == 0:
+                                scaler.step(optimizer)
+                                scaler.update()
+                                optimizer.zero_grad()
+
+                    running_loss += loss.item() * inputs.size(0)
+                    running_corrects += torch.sum(preds == labels.data)
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.cpu().numpy())
+
                 epoch_loss = running_loss / dataset_sizes[phase]
-                epoch_acc = running_corrects / dataset_sizes[phase]
-            
-                # Calculate precision, recall, and F1-score for both phases
-                if len(all_preds) > 0 and len(all_labels) > 0:
-                    precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
-                    recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
-                    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+                epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+                precision = precision_score(all_labels, all_preds, average='weighted')
+                recall = recall_score(all_labels, all_preds, average='weighted')
+                f1 = f1_score(all_labels, all_preds, average='weighted')
+
+                if phase == 'train':
+                    epoch_train_loss, epoch_train_acc, epoch_train_precision, epoch_train_recall, epoch_train_f1 = epoch_loss, epoch_acc, precision, recall, f1
                 else:
-                    precision = 0.0
-                    recall = 0.0
-                    f1 = 0.0
-            
-                log_file.write(f'{epoch+1},{phase},{epoch_loss:.4f},{epoch_acc:.4f},{precision:.4f},{recall:.4f},{f1:.4f}\n')
+                    epoch_val_loss, epoch_val_acc, epoch_val_precision, epoch_val_recall, epoch_val_f1 = epoch_loss, epoch_acc, precision, recall, f1
+
                 print(f'  {phase.capitalize()} Phase:')
-                # Print the metrics
                 print(f'    Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1:.4f}')
 
                 if phase == 'val':
-                    # Early stopping logic
+                    scheduler.step(epoch_loss)
                     early_stopping(epoch_loss, model)
                     if early_stopping.early_stop:
-                        print("Early stopping triggered")
+                        print("Early stopping")
                         model.load_state_dict(early_stopping.best_model_wts)
                         return model
-                    # Track best accuracy model
                     if epoch_acc > best_acc:
                         best_acc = epoch_acc
                         best_model_wts = copy.deepcopy(model.state_dict())
 
+            log_file.write(f'{epoch+1},{epoch_train_loss:.4f},{epoch_train_acc:.4f},{epoch_train_precision:.4f},{epoch_train_recall:.4f},{epoch_train_f1:.4f},{epoch_val_loss:.4f},{epoch_val_acc:.4f},{epoch_val_precision:.4f},{epoch_val_recall:.4f},{epoch_val_f1:.4f}\n')
             print()
 
-    print(f'Best val Acc: {best_acc:.4f}')
-    # Load best model weights
-    model.load_state_dict(best_model_wts)
-    return model
+        print(f'Best val Acc: {best_acc:.4f}')
+        model.load_state_dict(best_model_wts)
+        return model
 
-# Định nghĩa tiêu chuẩn và bộ tối ưu hóa
+# Khởi tạo mô hình kết hợp
+
+model = CombinedModel(efficientnet, mobilenet, resnet50, num_classes=len(dataset.classes)).to(device)
+
+# Sử dụng DataParallel để sử dụng nhiều GPU
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs!")
+    model = nn.DataParallel(model)
+    
+# Định nghĩa loss function và optimizer
 criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
-optimizer = optim.Adam(model.parameters(), lr=0.0001)
-scaler = GradScaler()  # Initialize GradScaler for mixed precision
+optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.0001)
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-12)
 early_stopping = EarlyStopping(patience=25, verbose=True)
-model = train_model(model, criterion, early_stopping, optimizer, num_epochs=200)
+scaler = GradScaler()
+swa_model = AveragedModel(model)
+swa_scheduler = SWALR(optimizer, swa_lr=0.05)
+swa_start = 100  # Example epoch to start SWA
+
+# Huấn luyện mô hình
+model = train_model(model, criterion, optimizer, scheduler, early_stopping, num_epochs=200)
+
+# Update BN statistics for the SWA model at the end of training
+torch.optim.swa_utils.update_bn(train_loader, swa_model)
 
 # Đánh giá mô hình
+
+
 def evaluate_model(model, dataloader):
     model.eval()
     all_preds = []
     all_labels = []
+    all_probs = []
     with torch.no_grad():
         for inputs, labels in dataloader:
             inputs = inputs.to(device)
             labels = labels.to(device)
             outputs = model(inputs)
             _, preds = torch.max(outputs, 1)
+            probs = F.softmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
     
     precision = precision_score(all_labels, all_preds, average='weighted')
     recall = recall_score(all_labels, all_preds, average='weighted')
     f1 = f1_score(all_labels, all_preds, average='weighted')
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
     
-    # Calculate AUC
-    all_labels_bin = label_binarize(all_labels, classes=range(num_classes))
-    all_preds_bin = label_binarize(all_preds, classes=range(num_classes))
-    auc = roc_auc_score(all_labels_bin, all_preds_bin, average='weighted', multi_class='ovr')
-    
-    with open('efficientnet_b4+Resnet50_log.csv', 'a') as log_file:
-        log_file.write('Evaluation Metrics:\n')
-        log_file.write(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}, AUC: {auc:.4f}\n')
-    
-    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}, AUC: {auc:.4f}')
+    # Calculate AUC for each class and average
+    auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='weighted')
+    print(f'Accuracy: {accuracy:.4f} Precision: {precision:.4f} Recall: {recall:.4f} F1 Score: {f1:.4f} AUC: {auc:.4f}')
+    with open(name_log+'.csv', 'a') as log_file:
+        log_file.write(f'Accuracy: {accuracy:.4f} Precision: {precision:.4f} Recall: {recall:.4f} F1 Score: {f1:.4f} AUC: {auc:.4f}\n')
 
+with open(name_log+'.csv', 'a') as log_file:
+    log_file.write('\n')
+    log_file.write('Evaluation on Dataset 1:\n')
+print('Evaluation on Dataset 1:')
 evaluate_model(model, dataloaders['val'])
 
-# Đánh giá mô hình trên tập dữ liệu kiểm tra
-with open('efficientnet_b4+Resnet50_log.csv', 'a') as log_file:
-    log_file.write('\n')
-    log_file.write('Evaluation on Test Set:\n')
 dataset_2_dir = '/kaggle/working/NLN-Loi-Phat/Dataset_2/'
 dataset_2 = datasets.ImageFolder(root=dataset_2_dir, transform=data_transforms['val'])
 test_loader = DataLoader(dataset_2, batch_size=64, shuffle=False, num_workers=4)
-print('Evaluation on Test Set:')
+with open(name_log+'.csv', 'a') as log_file:
+    log_file.write('\n')
+    log_file.write('Evaluation on Dataset 2:\n')
+print('Evaluation on Dataset 2:')
 evaluate_model(model, test_loader)
 
-# In ra ma trận nhầm lẫn (confusion matrix)
-import matplotlib.pyplot as plt
-
+# IN CONFUSION MATRIX
 def plot_confusion_matrix(model, dataloader, classes, name):
     model.eval()
     all_preds = []
@@ -361,19 +380,20 @@ def plot_confusion_matrix(model, dataloader, classes, name):
             all_labels.extend(labels.cpu().numpy())
     
     cm = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(10, 8))
+    plt.figure(figsize=(10, 10))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title('Confusion Matrix')
     plt.savefig(name)
     plt.show()
-    
 
 # Plot confusion matrix for validation set
-plot_confusion_matrix(model, dataloaders['val'], dataset.classes, 'efficientnet-B4+Resnet50_val_cm.png')
+print('Confusion Matrix on Dataset 1:')
+plot_confusion_matrix(model, dataloaders['val'], dataset.classes, name_log+'.png')
 # Plot confusion matrix for test set
-plot_confusion_matrix(model, test_loader, dataset_2.classes, 'efficientnet-B4+Resnet50_test_cm.png')
+print('Confusion Matrix on Dataset 2:')
+plot_confusion_matrix(model, test_loader, dataset_2.classes, name_log+'.png')
 
 # Capture the summary output
 summary_str = StringIO()
@@ -388,7 +408,9 @@ total_params = next(line for line in summary_lines if line.startswith('Total par
 trainable_params = next(line for line in summary_lines if line.startswith('Trainable params')).replace(',', '')
 
 # Write the required lines to the file
-with open('efficientnet_b4+Resnet50_log.csv', 'a') as f:
+with open(name_log+'.csv', 'a') as f:
     f.write('Model Summary:\n')
     f.write(total_params + '\n')
     f.write(trainable_params + '\n')
+    
+torch.save(model.state_dict(), name_log+'.pth')

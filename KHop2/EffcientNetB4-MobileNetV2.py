@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -190,7 +191,7 @@ class EarlyStopping:
         self.val_loss_min = val_loss
         
 # Hàm huấn luyện
-def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad_clip=1.0):
+def train_model(model, criterion, early_stopping, optimizer, scheduler, num_epochs=50, grad_clip=1.0):
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
     # Open a file to log the training process
@@ -278,6 +279,8 @@ def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad
                 print(f'    Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1:.4f}')
 
                 if phase == 'val':
+                    # Step the scheduler
+                    scheduler.step(epoch_loss)
                     # Early stopping logic
                     early_stopping(epoch_loss, model)
                     if early_stopping.early_stop:
@@ -298,11 +301,11 @@ def train_model(model, criterion, early_stopping, optimizer, num_epochs=50, grad
 
 # Định nghĩa tiêu chuẩn và bộ tối ưu hóa
 criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
-criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
 scaler = GradScaler()  # Initialize GradScaler for mixed precision
 early_stopping = EarlyStopping(patience=25, verbose=True)
-model = train_model(model, criterion, early_stopping, optimizer, num_epochs=200)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+model = train_model(model, criterion, early_stopping, optimizer, scheduler,num_epochs=200)
 
 # Đánh giá mô hình
 def evaluate_model(model, dataloader):

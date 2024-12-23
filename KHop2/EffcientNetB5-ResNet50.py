@@ -14,7 +14,8 @@ import seaborn as sns
 from torchsummary import summary
 from io import StringIO
 import sys
-
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import label_binarize
 # Vô hiệu hóa cảnh báo FutureWarning, UserWarning, DeprecationWarning
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -81,11 +82,12 @@ class CombinedModel(nn.Module):
         self.fc2 = nn.Linear(1024, 512)
         self.bn2 = nn.BatchNorm1d(512)
         self.fc3 = nn.Linear(512, num_classes)
-    
+        self.dropout = nn.Dropout(0.5)
     def forward(self, x):
         out1 = self.efficientnet(x)
         out2 = self.resnet(x)
         combined_out = torch.cat((out1, out2), dim=1)
+        combined_out = self.dropout(combined_out)
         combined_out = torch.relu(self.bn1(self.fc1(combined_out)))
         combined_out = torch.relu(self.bn2(self.fc2(combined_out)))
         final_out = self.fc3(combined_out)
@@ -313,14 +315,22 @@ def evaluate_model(model, dataloader):
             _, preds = torch.max(outputs, 1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+    
     precision = precision_score(all_labels, all_preds, average='weighted')
     recall = recall_score(all_labels, all_preds, average='weighted')
     f1 = f1_score(all_labels, all_preds, average='weighted')
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
+    
+    # Calculate AUC
+    all_labels_bin = label_binarize(all_labels, classes=range(num_classes))
+    all_preds_bin = label_binarize(all_preds, classes=range(num_classes))
+    auc = roc_auc_score(all_labels_bin, all_preds_bin, average='weighted', multi_class='ovr')
+    
     with open('efficientnet_b5+Resnet50_log.csv', 'a') as log_file:
         log_file.write('Evaluation Metrics:\n')
-        log_file.write(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}\n')
-    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}')
+        log_file.write(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}, AUC: {auc:.4f}\n')
+    
+    print(f'Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}, AUC: {auc:.4f}')
 
 evaluate_model(model, dataloaders['val'])
 

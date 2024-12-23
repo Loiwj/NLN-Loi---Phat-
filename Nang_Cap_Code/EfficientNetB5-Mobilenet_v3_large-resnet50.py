@@ -60,14 +60,6 @@ efficientnet = EfficientNet.from_pretrained('efficientnet-b5')
 mobilenet = models.mobilenet_v3_large(pretrained=True)
 resnet50 = models.resnet50(pretrained=True)
 
-# Fine-tune cả ba mô hình
-for param in efficientnet.parameters():
-    param.requires_grad = True
-for param in mobilenet.parameters():
-    param.requires_grad = True
-for param in resnet50.parameters():
-    param.requires_grad = True
-
 # Chỉnh sửa lớp đầu ra cuối cùng
 num_ftrs_efficient = efficientnet._fc.in_features
 efficientnet._fc = nn.Linear(num_ftrs_efficient, 512)
@@ -89,24 +81,17 @@ class CombinedModel(nn.Module):
         self.bn1 = nn.BatchNorm1d(1024)
         self.fc2 = nn.Linear(1024, 512)
         self.bn2 = nn.BatchNorm1d(512)
-        self.fc3 = nn.Linear(512, 256)
-        self.bn3 = nn.BatchNorm1d(256)
-        self.fc4 = nn.Linear(256, num_classes)
-    
-        self.attention = nn.MultiheadAttention(embed_dim=512 * 3, num_heads=8)
+        self.fc3 = nn.Linear(512, num_classes)
+
     
     def forward(self, x):
         out1 = self.efficientnet(x)
         out2 = self.mobilenet(x)
         out3 = self.resnet50(x)
         combined_out = torch.cat((out1, out2, out3), dim=1)
-        combined_out = combined_out.unsqueeze(0)  # Add sequence dimension
-        combined_out, _ = self.attention(combined_out, combined_out, combined_out)
-        combined_out = combined_out.squeeze(0)  # Remove sequence dimension
         combined_out = torch.relu(self.bn1(self.fc1(combined_out)))
         combined_out = torch.relu(self.bn2(self.fc2(combined_out)))
-        combined_out = torch.relu(self.bn3(self.fc3(combined_out)))
-        final_out = self.fc4(combined_out)  
+        final_out = self.fc3(combined_out)  
         return final_out
 
 # Label Smoothing CrossEntropy
